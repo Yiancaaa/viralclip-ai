@@ -85,15 +85,21 @@ def _classify_error(msg: str) -> tuple[str, str]:
     return ("failed", f"Descarga fallida: {msg[:500]}")
 
 
-def _ydl_opts(cookies_path: str | None, outtmpl: str | None = None) -> dict:
-    # Clientes de reproductor: primero las apps (Android/iOS, vía la API
+def _ydl_opts(cookies_path: str | None, outtmpl: str | None = None,
+               player_client: list[str] | None = None) -> dict:
+    # Clientes de reproductor: primero las apps (Android, vía la API
     # innertube), y la web solo como último recurso. Medido 2026-11-26:
     # desde servidores en la nube el cliente web devuelve la página de
     # «confirma que no eres un robot» (o una respuesta sin formatos, que
     # se manifiesta como «Requested format is not available» aunque el
     # selector tenga el último recurso «best»), incluso con cookies
-    # válidas (jobs 5 y 8 con zfdmlW4tYjI). El cliente Android sí
-    # devuelve formatos (itag 18, 640x360) para ese mismo vídeo.
+    # válidas (jobs 5, 8, 9, 10 y 11 con zfdmlW4tYjI). El cliente
+    # Android sí devuelve formatos para ese mismo vídeo (itag 18,
+    # 640x360). OJO: Android (y iOS) NO admiten cookies en yt-dlp
+    # (SUPPORTS_COOKIES=False): si se pasan cookies, yt-dlp descarta
+    # esos clientes en silencio y solo queda la web. Por eso el intento
+    # con Android va SIN cookies; las cookies solo se usan en el
+    # intento de reserva con la web (ver download_video_url).
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
@@ -104,8 +110,9 @@ def _ydl_opts(cookies_path: str | None, outtmpl: str | None = None) -> dict:
         "retries": 3,
         "fragment_retries": 3,
         "restrictfilenames": True,
-        "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
     }
+    if player_client:
+        opts["extractor_args"] = {"youtube": {"player_client": player_client}}
     if cookies_path:
         opts["cookiefile"] = cookies_path
     if outtmpl:
@@ -113,7 +120,8 @@ def _ydl_opts(cookies_path: str | None, outtmpl: str | None = None) -> dict:
     return opts
 
 
-def extract_info(url: str, cookies_path: str | None = None) -> dict:
+def extract_info(url: str, cookies_path: str | None = None,
+                 player_client: list[str] | None = None) -> dict:
     """Metadatos del vídeo sin descargarlo. Lanza DownloadError si
     YouTube bloquea o el vídeo no existe."""
     ok, video_id = is_youtube_video_url(url)
@@ -123,7 +131,7 @@ def extract_info(url: str, cookies_path: str | None = None) -> dict:
                             "(watch?v=..., youtu.be/..., shorts/...).")
     try:
         import yt_dlp
-        with yt_dlp.YoutubeDL(_ydl_opts(cookies_path)) as ydl:
+        with yt_dlp.YoutubeDL(_ydl_opts(cookies_path, player_client=player_client)) as ydl:
             info = ydl.extract_info(url, download=False)
     except DownloadError:
         raise
@@ -141,13 +149,12 @@ def extract_info(url: str, cookies_path: str | None = None) -> dict:
     }
 
 
-def download_video_url(url: str, dest_dir: str | Path,
-                       cookies_path: str | None = None,
-                       max_duration_s: int = MAX_DURATION_SECONDS,
-                       max_size_bytes: int = MAX_SIZE_BYTES) -> dict:
-    """Descarga el vídeo y devuelve {path, title, duration_seconds,
-    video_id, size_bytes}. Comprueba duración y tamaño antes de bajar."""
-    info = extract_info(url, cookies_path)
+def _download_once(url: str, dest_dir: str | Path,
+                   cookies_path: str | None,
+                   player_client: list[str] | None,
+                   max_duration_s: int, max_size_bytes: int) -> dict:
+    """Un intento de descarga con una combinación de cookies/cliente."""
+    info = extract_info(url, cookies_path, player_client=player_client)
     duration = info["duration_seconds"]
     if duration and duration > max_duration_s:
         raise DownloadError(
@@ -165,7 +172,7 @@ def download_video_url(url: str, dest_dir: str | Path,
     outtmpl = str(dest / "%(id)s.%(ext)s")
     try:
         import yt_dlp
-        with yt_dlp.YoutubeDL(_ydl_opts(cookies_path, outtmpl)) as ydl:
+        with yt_dlp.YoutubeDL(_ydl_opts(cookies_path, outtmpl, player_client)) as ydl:
             ydl.download([url])
     except DownloadError:
         raise
@@ -194,3 +201,34 @@ def download_video_url(url: str, dest_dir: str | Path,
     return {"path": str(path), "title": info["title"],
             "duration_seconds": duration, "video_id": info["video_id"],
             "size_bytes": size}
+
+
+def download_video_url(url: str, dest_dir: str | Path,
+                       cookies_path: str | None = None,
+                       max_duration_s: int = MAX_DURATION_SECONDS,
+                       max_size_bytes: int = MAX_SIZE_BYTES) -> dict:
+    """Descarga el vídeo y devuelve {path, title, duration_seconds,
+    video_id, size_bytes}. Comprueba duración y tamaño antes de bajar.
+
+    Dos intentos, en orden: (1) cliente Android SIN cookies — las apps
+    no admiten cookies y el cliente web es el que YouTube bloquea desde
+    la nube; (2) clientes por defecto CON las cookies del usuario (el
+    comportamiento anterior), por si el vídeo solo se sirve por web.
+    Si el primer intento falla por duración/tamaño no se reintenta: es
+    una decisión sobre el vídeo, no sobre la red.
+    """
+    attempts = [
+        (None, ["android"]),
+        (cookies_path, None),
+    ]
+    last_error: DownloadError | None = None
+    for cpath, pclient in attempts:
+        try:
+            return _download_once(url, dest_dir, cpath, pclient,
+                                  max_duration_s, max_size_bytes)
+        except DownloadError as e:
+            if e.code in ("too_long", "too_big"):
+                raise
+            last_error = e
+    assert last_error is not None
+    raise last_error
