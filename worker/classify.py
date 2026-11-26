@@ -400,7 +400,7 @@ def classify_video(video_path: str, sample_seconds: int = 60,
     whisper `tiny` para que la transcripción de la muestra sea rápida y
     quepa en ~1 GB de RAM.
     """
-    from worker.pipeline import extract_audio, probe_duration, transcribe
+    from worker.pipeline import extract_audio, probe_duration, transcribe_subprocess
 
     duration = probe_duration(video_path)
     sample = min(float(sample_seconds), duration)
@@ -419,7 +419,9 @@ def classify_video(video_path: str, sample_seconds: int = 60,
                         "-c:a", "pcm_s16le", audio],
                        check=True, capture_output=True, text=True)
         try:
-            segments = transcribe(audio, model=whisper_model)
+            # En subproceso aparte: el modelo nunca se carga en el
+            # proceso web (512 MB en el plan Free de Render).
+            segments = transcribe_subprocess(audio, model=whisper_model)
         except Exception:
             segments = []
         speech_signals = extract_speech_signals(segments, sample)

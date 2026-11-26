@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,12 @@ from worker.kinetic_subs import zoom_crop_expression
 
 # ---------------------------------------------------------------- utilidades
 def run(cmd: list[str], timeout: int | None = None) -> subprocess.CompletedProcess:
+    # ffmpeg: un solo hilo de trabajo. En el plan Free de Render (0,1 CPU
+    # compartida) más hilos no aceleran nada y cada hilo guarda búferes de
+    # fotogramas 1080x1920, lo que disparaba la memoria del render
+    # (pico medido 849 MB con tiny en proceso, 2026-11-26).
+    if cmd and cmd[0] == "ffmpeg":
+        cmd = ["ffmpeg", "-threads", "1"] + cmd[1:]
     return subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
 
 
@@ -83,21 +90,31 @@ class TranscriptSegment:
     words: list[Word] = field(default_factory=list)
 
 
-def transcribe(audio_path: str, model: str = "small", device: str = "cpu",
-               compute_type: str = "int8", language: str = "es") -> list[TranscriptSegment]:
+def transcribe(audio_path: str, model: str = "tiny", device: str = "cpu",
+               compute_type: str = "int8", language: str = "es",
+               cpu_threads: int = 4, vad_filter: bool = True) -> list[TranscriptSegment]:
     """faster-whisper real, con timestamps de palabra (word_timestamps=True).
-    Modelo por defecto 'small' en CPU para desarrollo; 'large-v3-turbo'
-    documentado como opción con más RAM/GPU."""
+
+    Modelo por defecto 'tiny' (el más ligero): en el plan Free de Render
+    (512 MB) 'small' tumbaba el servidor por falta de memoria (OOM
+    2026-11-26). El modelo se libera explícitamente al terminar para que
+    el render posterior (FFmpeg) tenga memoria disponible.
+    """
+    import gc
+
     from faster_whisper import WhisperModel
 
-    m = WhisperModel(model, device=device, compute_type=compute_type)
+    m = WhisperModel(model, device=device, compute_type=compute_type,
+                     cpu_threads=cpu_threads)
     segments, _info = m.transcribe(audio_path, language=language, word_timestamps=True,
-                                   vad_filter=True)
+                                   vad_filter=vad_filter)
     out: list[TranscriptSegment] = []
     for s in segments:
         words = [Word(w.word.strip(), float(w.start), float(w.end))
                  for w in (s.words or []) if w.word.strip()]
         out.append(TranscriptSegment(s.text.strip(), float(s.start), float(s.end), words))
+    del m
+    gc.collect()
     return out
 
 
@@ -105,6 +122,32 @@ def segments_to_json(segments: list[TranscriptSegment]) -> list[dict]:
     return [{"text": s.text, "start": s.start, "end": s.end,
              "words": [{"text": w.text, "start": w.start, "end": w.end} for w in s.words]}
             for s in segments]
+
+
+def transcribe_subprocess(audio_path: str, model: str = "tiny", device: str = "cpu",
+                          compute_type: str = "int8", language: str = "es") -> list[TranscriptSegment]:
+    """Transcripción en un proceso aparte (``worker/transcribe_cli.py``).
+
+    Devuelve los mismos ``TranscriptSegment`` que :func:`transcribe`, pero
+    el modelo y sus librerías nunca se cargan en el proceso web: el
+    subproceso muere al terminar y el sistema operativo recupera toda su
+    memoria. Es la pieza que hace que el proceso quepa en 512 MB.
+
+    Dieta del subproceso (producción, 512 MB): 1 hilo de CPU y sin VAD
+    (sin onnxruntime). Con 0,1 CPU más hilos no aceleran y cada hilo
+    guarda búferes; el VAD solo filtra segmentos sin voz y el pipeline
+    ya recorta por pausas entre palabras.
+    """
+    out = subprocess.run(
+        [sys.executable, "-m", "worker.transcribe_cli",
+         audio_path, model, device, compute_type, language, "1", "0"],
+        check=True, capture_output=True, text=True, timeout=3600)
+    data = json.loads(out.stdout)
+    return [TranscriptSegment(
+                s["text"], float(s["start"]), float(s["end"]),
+                [Word(w["text"], float(w["start"]), float(w["end"]))
+                 for w in s.get("words", [])])
+            for s in data]
 
 
 # ---------------------------------------------------------------- detección de momentos
@@ -617,7 +660,10 @@ def render_clip(source: str, start: float, end: float, subtitles: list[dict],
     sub_filter = f"subtitles='{ass_path}':force_style='Fontsize=64'"
     base = ["ffmpeg", "-y", "-v", "error", "-ss", str(start), "-i", source,
             "-t", str(dur)]
-    common = ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+    # Hilos del codificador y de los filtros a 1: con 0,1 CPU no aceleran
+    # y cada hilo guarda búferes de fotogramas 1080x1920 (ver run()).
+    common = ["-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
+              "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
               "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_path]
     if layout == "gameplay_only":
         # Escalar para cubrir 1080x1920 y recortar. Con foco en rostro
@@ -709,7 +755,9 @@ def _render_clip_dynamic(source: str, start: float, end: float, words: list[Word
     # conversación, como el estático).
     base = _dynamic_base(category, focus_x)
     dur = (end - start) - (plan.total_removed if use_trim else 0.0)
-    common = ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+    # Hilos del codificador y de los filtros a 1 (ver run()).
+    common = ["-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
+              "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
               "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_path]
     composed = layout in ("facecam_top", "facecam_bottom", "multi_window")
     src_w = src_h = None

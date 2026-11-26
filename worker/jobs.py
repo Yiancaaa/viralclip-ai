@@ -8,6 +8,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
+from viralclip.config import settings
 from viralclip.models import Clip, Job, Moment, Video
 from viralclip.storage import Storage
 from worker import pipeline
@@ -82,7 +83,16 @@ def process_job(db: Session, job_id: int, storage: Storage, workdir: str = "./da
             Path(local_src).write_bytes(storage.read(src))
         audio = os.path.join(workdir, f"audio_{video.id}.wav")
         pipeline.extract_audio(local_src, audio)
-        segments = pipeline.transcribe(audio)
+        # Modelo CONFIGURADO (settings.whisper_model), no el default de
+        # transcribe(): en vivo es 'tiny' por la RAM (512 MB en Render
+        # Free); llamar sin modelo usaba 'small' (~244 MB) y tumbaba el
+        # servidor por falta de memoria (OOM 2026-11-26). La transcripción
+        # corre en un subproceso aparte (transcribe_subprocess): el modelo
+        # y sus librerías nunca se cargan en el proceso web.
+        segments = pipeline.transcribe_subprocess(
+            audio, model=settings.whisper_model,
+            device=settings.whisper_device,
+            compute_type=settings.whisper_compute_type)
         # Categoría efectiva: manual > automática > 'otros' (neutro).
         category, cat_source = effective_category(video)
         focus_x = None

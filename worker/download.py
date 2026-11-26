@@ -29,11 +29,16 @@ _YT_VIDEO_RE = re.compile(
 )
 
 # Formato: mejor vídeo ≤1080p en MP4 + mejor audio M4A; si no hay MP4,
-# mejor vídeo ≤1080p + audio; último recurso, el mejor disponible.
-# merge_output_format=mp4 deja el archivo listo para el pipeline.
+# mejor vídeo ≤1080p + audio; si el vídeo solo existe como DASH (sin
+# formato combinado) o es vertical con altura >1080p (Shorts), el último
+# recurso sin filtros descarga lo mejor disponible. merge_output_format
+# =mp4 deja el archivo listo para el pipeline. (2026-11-26: el vídeo
+# zfdmlW4tYjI de Juan falló con "Requested format is not available"
+# porque ningún selector con filtros casaba con sus formatos.)
 FORMAT = ("bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
           "bestvideo[height<=1080]+bestaudio/"
-          "best[height<=1080][ext=mp4]/best")
+          "best[height<=1080][ext=mp4]/best/"
+          "bestvideo+bestaudio/best")
 MAX_DURATION_SECONDS = 7200  # 2 h por defecto (configurable por settings)
 MAX_SIZE_BYTES = 2 * 1024 ** 3  # 2 GB por defecto (= MAX_UPLOAD_GB)
 
