@@ -86,6 +86,14 @@ def _classify_error(msg: str) -> tuple[str, str]:
 
 
 def _ydl_opts(cookies_path: str | None, outtmpl: str | None = None) -> dict:
+    # Clientes de reproductor: primero las apps (Android/iOS, vía la API
+    # innertube), y la web solo como último recurso. Medido 2026-11-26:
+    # desde servidores en la nube el cliente web devuelve la página de
+    # «confirma que no eres un robot» (o una respuesta sin formatos, que
+    # se manifiesta como «Requested format is not available» aunque el
+    # selector tenga el último recurso «best»), incluso con cookies
+    # válidas (jobs 5 y 8 con zfdmlW4tYjI). El cliente Android sí
+    # devuelve formatos (itag 18, 640x360) para ese mismo vídeo.
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
@@ -96,6 +104,7 @@ def _ydl_opts(cookies_path: str | None, outtmpl: str | None = None) -> dict:
         "retries": 3,
         "fragment_retries": 3,
         "restrictfilenames": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
     }
     if cookies_path:
         opts["cookiefile"] = cookies_path
