@@ -118,31 +118,177 @@ async function loadStreams() {
 }
 $("#btn-refresh-streams").addEventListener("click", loadStreams);
 
-/* ---------- subida + clasificación ---------- */
+/* ---------- subida directa (URL prefirmada) + reserva clásica ---------- */
+// Flujo nuevo: el navegador hashea el archivo (SHA-256) y lee su
+// duración, pide una URL prefirmada (POST /api/videos/upload/presign),
+// sube el archivo DIRECTO a S3 con PUT (barra de progreso real, sin
+// pasar por el proceso web) y registra el vídeo
+// (POST /api/videos/upload/complete). Si la subida directa no está
+// disponible (backend local, 501) o el PUT falla (red/CORS del
+// bucket), se usa la subida clásica multipart como reserva.
+async function sha256Hex(file) {
+  const buf = await file.arrayBuffer();
+  const hash = await crypto.subtle.digest("SHA-256", buf);
+  return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function fileDurationSeconds(file) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const v = document.createElement("video");
+    v.preload = "metadata";
+    v.onloadedmetadata = () => { URL.revokeObjectURL(url); resolve(v.duration || 0); };
+    v.onerror = () => { URL.revokeObjectURL(url); resolve(0); };
+    v.src = url;
+  });
+}
+
+function putWithProgress(url, file, contentType, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", url);
+    xhr.setRequestHeader("Content-Type", contentType);
+    xhr.upload.onprogress = (ev) => { if (ev.lengthComputable) onProgress(ev.loaded / ev.total); };
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300
+      ? resolve()
+      : reject(new Error(`PUT directo: HTTP ${xhr.status}`)));
+    xhr.onerror = () => reject(new Error("PUT directo: error de red (puede ser CORS del bucket; se intentará la subida clásica)"));
+    xhr.send(file);
+  });
+}
+
+async function legacyUpload(file, title) {
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("title", title);
+  const r = await fetch("/api/videos/upload", { method: "POST", body: fd });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+  return data;
+}
+
+async function finishUpload(data, box) {
+  $("#upload-progress").hidden = true;
+  currentVideoId = data.id;
+  const dup = data.duplicate
+    ? ` · ⚠ duplicado de vídeo #${data.duplicate_of} (mismo SHA-256, no se guardó otra copia)` : "";
+  box.textContent = `Vídeo #${data.id} · título: ${data.title || ""} · ${fmtBytes(data.file_size_bytes ?? data.size_bytes)}${dup}`;
+  $("#video-panel").hidden = false;
+  $("#video-id-label").textContent = "#" + data.id;
+  $("#video-info").textContent = `file_path: ${data.file_path || "—"}`;
+  await loadVideo(data.id);
+  await loadVideos();
+}
+
 $("#upload-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const file = $("#upload-file").files[0];
   if (!file) return;
   const box = $("#upload-result");
-  box.textContent = "Subiendo… (puede tardar; el archivo se hashea con SHA-256)";
-  const fd = new FormData();
-  fd.append("file", file);
-  fd.append("title", $("#upload-title").value || file.name);
+  const bar = $("#upload-progress");
+  const title = $("#upload-title").value || file.name;
+  bar.hidden = false;
+  bar.value = 0;
   try {
-    const r = await fetch("/api/videos/upload", { method: "POST", body: fd });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
-    currentVideoId = data.id;
-    const dup = data.duplicate_of && data.duplicate_of !== undefined
-      ? ` · ⚠ duplicado de vídeo #${data.duplicate_of} (mismo SHA-256, no se guardó otra copia)`
-      : "";
-    box.textContent = `Vídeo #${data.id} · título: ${data.title || ""} · ${fmtBytes(data.size_bytes)}${dup}`;
-    $("#video-panel").hidden = false;
-    $("#video-id-label").textContent = "#" + data.id;
-    $("#video-info").textContent = `file_path: ${data.file_path || "—"}`;
-    await loadVideo(data.id);
-  } catch (e) { box.textContent = "Error al subir: " + e.message; }
+    box.textContent = "Calculando SHA-256 y duración…";
+    let sha;
+    try {
+      sha = await sha256Hex(file);
+    } catch (e) {
+      box.textContent = "No se pudo hashear el archivo en el navegador; usando la subida clásica…";
+      return finishUpload(await legacyUpload(file, title), box);
+    }
+    const duration = await fileDurationSeconds(file);
+    box.textContent = "Pidiendo URL de subida directa…";
+    const r = await fetch("/api/videos/upload/presign", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: file.name, size_bytes: file.size, sha256: sha, title,
+        duration_seconds: duration, content_type: file.type || "video/mp4",
+      }),
+    });
+    const pre = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      if (r.status === 501) {
+        box.textContent = "Subida directa no disponible en este backend; usando la subida clásica…";
+        return finishUpload(await legacyUpload(file, title), box);
+      }
+      throw new Error(pre.detail || `HTTP ${r.status}`);
+    }
+    if (pre.duplicate) {
+      bar.hidden = true;
+      box.textContent = `⚠ Ese vídeo ya existe (#${pre.video_id} · ${pre.title || ""}); no hizo falta subirlo.`;
+      currentVideoId = pre.video_id;
+      $("#video-panel").hidden = false;
+      $("#video-id-label").textContent = "#" + pre.video_id;
+      await loadVideo(pre.video_id);
+      await loadVideos();
+      return;
+    }
+    box.textContent = "Subiendo directo a S3… (el archivo no pasa por el servidor)";
+    await putWithProgress(pre.upload_url, file, pre.content_type, (p) => {
+      bar.value = Math.round(p * 100);
+      box.textContent = `Subiendo directo a S3… ${Math.round(p * 100)}% (${fmtBytes(file.size * p)} de ${fmtBytes(file.size)})`;
+    });
+    box.textContent = "Subida completada. Registrando el vídeo…";
+    const done = await api("/api/videos/upload/complete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        key: pre.key, sha256: sha, filename: file.name, title,
+        size_bytes: file.size, duration_seconds: duration,
+      }),
+    });
+    bar.value = 100;
+    return finishUpload(done, box);
+  } catch (e) {
+    // Si el PUT directo falló (red/CORS), un intento con la subida clásica.
+    if (/PUT directo/.test(e.message)) {
+      try {
+        box.textContent = "La subida directa falló; intentando la subida clásica…";
+        bar.value = 0;
+        return finishUpload(await legacyUpload(file, title), box);
+      } catch (e2) { bar.hidden = true; box.textContent = "Error al subir: " + e2.message; return; }
+    }
+    bar.hidden = true;
+    box.textContent = "Error al subir: " + e.message;
+  }
 });
+
+async function loadVideos() {
+  const list = $("#videos-list");
+  try {
+    const videos = await api("/api/videos");
+    if (!videos.length) { list.innerHTML = "<li>Sin vídeos subidos todavía.</li>"; return; }
+    list.innerHTML = videos.map((v) => `
+      <li>
+        <strong>#${v.id} ${esc(v.title || "")}</strong> — plataforma: ${esc(v.platform)} · duración: ${fmtSecs(v.duration_seconds || 0)} · ${fmtBytes(v.file_size_bytes || 0)}<br>
+        <span class="hint">estado de proceso: <strong>${esc(v.process_status)}</strong> · clips: ${v.clips_count} · categoría: ${esc(v.effective_category || "otros")} · creado: ${esc(v.created_at || "—")}</span><br>
+        <button type="button" data-select-video="${v.id}">Seleccionar</button>
+        <button type="button" data-process-video="${v.id}" ${(v.process_status === "processing" || v.process_status === "queued") ? "disabled" : ""}>Procesar</button>
+      </li>`).join("");
+    list.querySelectorAll("[data-select-video]").forEach((b) => b.addEventListener("click", async () => {
+      currentVideoId = Number(b.dataset.selectVideo);
+      $("#video-panel").hidden = false;
+      $("#video-id-label").textContent = "#" + currentVideoId;
+      await loadVideo(currentVideoId);
+    }));
+    list.querySelectorAll("[data-process-video]").forEach((b) => b.addEventListener("click", async () => {
+      const vid = Number(b.dataset.processVideo);
+      const box = $("#process-result");
+      currentVideoId = vid;
+      $("#video-panel").hidden = false;
+      $("#video-id-label").textContent = "#" + vid;
+      box.textContent = "Procesando en segundo plano…";
+      try {
+        const r = await api(`/api/videos/${vid}/process`, { method: "POST" });
+        const j = await pollJob(r.job_id, box, "Procesando");
+        box.textContent = `Job #${j.id} · estado: ${j.status} · momentos: ${(j.moments || []).length} · clips listos en Mi biblioteca.`;
+        await loadLibrary(); await loadJobs(); await loadVideos();
+      } catch (e) { box.textContent = "Error al procesar: " + e.message; }
+    }));
+  } catch (e) { list.innerHTML = "<li>Error al cargar vídeos: " + esc(e.message) + "</li>"; }
+}
+$("#btn-refresh-videos").addEventListener("click", loadVideos);
 
 async function loadVideo(id) {
   try {
@@ -429,6 +575,6 @@ async function loadQuota() {
 }
 
 /* ---------- inicio ---------- */
-loadHealth(); loadStreams(); loadLibrary(); loadJobs(); loadQuota(); loadCookiesStatus();
+loadHealth(); loadStreams(); loadLibrary(); loadJobs(); loadQuota(); loadCookiesStatus(); loadVideos();
 setInterval(loadQuota, 60000);
 setInterval(loadLibrary, 60000);
