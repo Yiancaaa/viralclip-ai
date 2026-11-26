@@ -1,0 +1,57 @@
+# Egress test — ¿sirven las IPs de GitHub Actions para descargar de YouTube?
+#
+# Contexto (2026-11-26): YouTube bloquea yt-dlp desde la IP de Render
+# (jobs 5-14: "Sign in to confirm you're not a bot" / "Requested format
+# is not available") y desde esta VM (desde ~05:20 AST; a las 04:49 el
+# cliente Android sí listaba formatos desde la VM). Este workflow prueba
+# si los runners de GitHub Actions (IPs de Azure) corren mejor suerte.
+#
+# Qué hace: instala yt-dlp 2026.11.23 y corre --list-formats sobre el
+# vídeo de prueba del propio usuario (zfdmlW4tYjI) con el cliente por
+# defecto y con el cliente Android. No descarga el vídeo, solo lista
+# formatos. El run termina en rojo si ningún cliente devuelve formatos.
+#
+# Cómo lanzarlo: pestaña Actions del repo → "Egress test" → Run workflow.
+# Solo se ejecuta a mano (workflow_dispatch); no hay push ni schedule.
+# Si devuelve formatos, el egress de GitHub Actions serviría como vía de
+# descarga (habría que diseñar un workflow que descargue y suba el
+# archivo a Supabase). Si también falla, el bloqueo cubre Azure también.
+
+name: Egress test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  egress-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Instalar yt-dlp 2026.11.23
+        run: pip install yt-dlp==2026.11.23
+
+      - name: Listar formatos (cliente por defecto)
+        id: default
+        continue-on-error: true
+        run: |
+          yt-dlp --no-playlist --list-formats \
+            "https://www.youtube.com/watch?v=zfdmlW4tYjI" 2>&1 | tee /tmp/fmt_default.txt
+          echo "formats=$(grep -cE '^[0-9]+ ' /tmp/fmt_default.txt || true)" >> "$GITHUB_OUTPUT"
+
+      - name: Listar formatos (cliente android)
+        id: android
+        continue-on-error: true
+        run: |
+          yt-dlp --no-playlist --extractor-args "youtube:player_client=android" \
+            --list-formats "https://www.youtube.com/watch?v=zfdmlW4tYjI" 2>&1 | tee /tmp/fmt_android.txt
+          echo "formats=$(grep -cE '^[0-9]+ ' /tmp/fmt_android.txt || true)" >> "$GITHUB_OUTPUT"
+
+      - name: Resumen
+        run: |
+          echo "Formatos (cliente por defecto): ${{ steps.default.outputs.formats }}"
+          echo "Formatos (cliente android): ${{ steps.android.outputs.formats }}"
+          if [ "${{ steps.default.outputs.formats }}" = "0" ] && [ "${{ steps.android.outputs.formats }}" = "0" ]; then
+            echo "RESULTADO: YouTube NO devuelve formatos desde GitHub Actions. Egress bloqueado también aquí."
+            exit 1
+          else
+            echo "RESULTADO: hay formatos — el egress de GitHub Actions SÍ sirve."
+          fi
