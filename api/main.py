@@ -30,7 +30,9 @@ from worker.upload import (PRESIGNED_URL_EXPIRES_SECONDS,
 from worker.classify import (BUTTONS, CATEGORIES, SUBCATEGORIES,
                              classification_to_record, classify_video,
                              effective_category)
-from worker.expiry import expire_clips, time_remaining
+from worker.expiry import clips_expiring_soon, expire_clips, time_remaining
+from worker.hls import LiveSessionRunner
+from worker.jobs import active_process_job
 from worker.live import live_manager
 
 from contextlib import asynccontextmanager
@@ -49,19 +51,47 @@ async def lifespan(_app: FastAPI):
     try:
         db = SessionLocal()
         expire_clips(db, get_storage())
-        # Trabajos que quedaron a medias por un reinicio o un despliegue:
-        # no se reanudan solos; se marcan como error para no dejar un
-        # "processing" eterno en el panel.
+        # Trabajos que quedaron a medias por un reinicio o un despliegue.
+        # - "queued" de proceso: se RE-LANZAN (el hilo murió con el
+        #   reinicio pero el trabajo no empezó; el job lock ordena la
+        #   cola). Antes se marcaban como error y el usuario tenía que
+        #   re-procesar a mano.
+        # - "processing": se interrumpieron a mitad (temporales perdidos)
+        #   -> error con mensaje claro.
+        # - descargas: el Job no guarda la URL, no se pueden re-lanzar
+        #   -> error ("vuelve a pegar el enlace").
         stale = db.query(Job).filter(Job.status.in_(["queued", "processing"])).all()
+        relaunched = 0
         for j in stale:
+            if j.status == "queued" and j.kind == "process" and j.video_id is not None:
+                threading.Thread(target=_run_process_in_background,
+                                 args=(j.id,), daemon=True).start()
+                relaunched += 1
+                continue
             j.status = "error"
             j.error = ("Interrumpido por el reinicio del servidor; "
-                       "vuelve a procesar el vídeo.")
+                       "vuelve a procesar el vídeo."
+                       if j.kind == "process" else
+                       "Interrumpido por el reinicio del servidor; "
+                       "vuelve a pegar el enlace.")
         db.commit()
         db.close()
     except Exception:
         pass
     yield
+
+
+# Runner de directos (worker/hls.py): un solo ciclo por directo, máx. 3
+# simultáneos. Se crea perezosamente para no tocar el almacenamiento
+# en la importación del módulo.
+_live_runner: LiveSessionRunner | None = None
+
+
+def _get_live_runner() -> LiveSessionRunner:
+    global _live_runner
+    if _live_runner is None:
+        _live_runner = LiveSessionRunner(SessionLocal, get_storage())
+    return _live_runner
 
 
 app = FastAPI(title="VIRALCLIP AI", version="0.1.0", lifespan=lifespan)
@@ -102,7 +132,28 @@ def start_stream(stream_id: int, db: Session = Depends(get_db)):
     s = db.query(LiveSession).filter(LiveSession.id == stream_id).one_or_none()
     if not s:
         raise HTTPException(404, "live session no encontrada")
-    live_manager.set_status(stream_id, "live")
+    entry = live_manager.get(stream_id)
+    if entry is None:
+        # El manager es en memoria: tras un reinicio no conoce la sesión.
+        entry = live_manager.add(s.platform, s.channel, s.url)
+        live_manager._streams.pop(entry.id, None)
+        live_manager._streams[s.id] = entry
+        entry.id = s.id
+    if not live_manager.can_start():
+        live_manager.set_status(stream_id, "waiting",
+                                "Sin plaza libre (máx. 3 directos); en cola.")
+        s.status = "waiting"
+        db.commit()
+        return {"id": s.id, "status": "waiting",
+                "detail": "Sin plaza libre (máx. 3 directos); en cola."}
+    started = _get_live_runner().start(entry)
+    if not started:
+        live_manager.set_status(stream_id, "waiting",
+                                "Sin plaza libre (máx. 3 directos); en cola.")
+        s.status = "waiting"
+        db.commit()
+        return {"id": s.id, "status": "waiting",
+                "detail": "Sin plaza libre (máx. 3 directos); en cola."}
     s.status = "live"
     s.started_at = datetime.now(timezone.utc)
     db.commit()
@@ -125,6 +176,14 @@ def create_stream(body: StartRequest, db: Session = Depends(get_db)):
     live_manager._streams.pop(entry.id, None)
     live_manager._streams[s.id] = entry
     entry.id = s.id
+    # El manager marca "live" al primero sin verificar nada: si la
+    # validación NO confirmó que está en directo, no es "live" (era el
+    # falso "live" de la sesión #3 de YouTube sin API key).
+    if v["live_status"] != "live" and entry.status == "live":
+        entry.status = "waiting"
+        entry.detail = v["detail"]
+        s.status = "waiting"
+        db.commit()
     return {"id": s.id, "platform": s.platform, "channel": s.channel,
             "status": s.status, "live_status": v["live_status"], "detail": v["detail"]}
 
@@ -134,6 +193,7 @@ def stop_stream(stream_id: int, db: Session = Depends(get_db)):
     s = db.query(LiveSession).filter(LiveSession.id == stream_id).one_or_none()
     if not s:
         raise HTTPException(404, "live session no encontrada")
+    _get_live_runner().stop(stream_id)
     live_manager.stop(stream_id)
     s.status = "stopped"
     s.ended_at = datetime.now(timezone.utc)
@@ -418,10 +478,17 @@ def process_video(video_id: int, db: Session = Depends(get_db)):
 
     Antes era síncrono y Render cortaba la petición con 502 en vídeos
     largos. Ahora el panel sondea GET /api/jobs/{job_id} hasta done/error.
+    Un solo proceso a la vez (job lock, worker/jobs.py): si ya hay uno
+    en marcha o en cola, responde 409 en vez de crear otro job que
+    quedaría esperando sin que el panel lo sepa.
     """
     v = db.query(Video).filter(Video.id == video_id).one_or_none()
     if not v:
         raise HTTPException(404, "video no encontrado")
+    busy = active_process_job(db)
+    if busy is not None:
+        raise HTTPException(409, f"Ya hay un proceso en marcha (job {busy.id}); "
+                                 "espera a que termine y vuelve a intentarlo.")
     job = Job(video_id=v.id, kind="process", status="queued")
     db.add(job)
     db.commit()
@@ -642,6 +709,16 @@ def _clip_dict(c: Clip) -> dict:
 @app.get("/api/clips")
 def list_clips(db: Session = Depends(get_db)):
     return [_clip_dict(c) for c in db.query(Clip).order_by(Clip.score.desc()).all()]
+
+
+@app.get("/api/clips/expiring-soon")
+def clips_expiring(db: Session = Depends(get_db), within_hours: int = 24):
+    """Clips que caducan en menos de `within_hours` (aviso 24 h).
+
+    Solo clips vivos y NO favoritos (un favorito nunca caduca, así que
+    tampoco avisa). El panel lo sondea para avisar antes del borrado.
+    """
+    return clips_expiring_soon(db, within_hours=within_hours)
 
 
 @app.get("/api/library")
