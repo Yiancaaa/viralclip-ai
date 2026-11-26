@@ -72,17 +72,24 @@ def check_twitch_live(channel: str, client_id: str, client_secret: str) -> dict:
 
 
 def check_kick_live(channel: str) -> dict:
-    """Kick: API pública sin clave. GET /public/v1/channels?slug=..."""
+    """Kick: API pública v2 sin clave. GET /api/v2/channels/<slug>.
+
+    La v1 (/public/v1/channels) empezó a dar 401 el 2026-11-26, así
+    que ya no sirve. La v2 devuelve el canal con `livestream` (objeto
+    con session_title) cuando está en directo y None cuando no.
+    Verificado 2026-11-26: ac7ionman offline -> livestream None, y la
+    sonda streamlink coincidió (no está en directo).
+    """
     try:
-        data = _http_json(f"https://api.kick.com/public/v1/channels?slug={urllib.parse.quote(channel)}")
-        items = data.get("data", [])
-        if not items:
+        data = _http_json(f"https://kick.com/api/v2/channels/{urllib.parse.quote(channel)}")
+        ls = data.get("livestream")
+        if ls:
+            return {"status": "live", "detail": f"En directo: {ls.get('session_title','')}."}
+        return {"status": "offline", "detail": "El canal no está en directo según la API de Kick."}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
             return {"status": "not_found", "detail": "Canal no encontrado en Kick."}
-        ch = items[0]
-        livestream = ch.get("livestream")
-        if livestream:
-            return {"status": "live", "detail": f"En directo: {livestream.get('session_title','')}."}
-        return {"status": "offline", "detail": "El canal no está en directo según la API pública de Kick."}
+        return {"status": "not_verifiable", "detail": f"No se pudo consultar la API de Kick: {e}"}
     except Exception as e:
         return {"status": "not_verifiable", "detail": f"No se pudo consultar la API de Kick: {e}"}
 
