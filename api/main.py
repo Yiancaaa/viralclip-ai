@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from viralclip.connectors import validate_stream_url
 from viralclip.db import SessionLocal, init_db
 from viralclip.models import Clip, Job, LiveSession, Moment, Video
 from viralclip.storage import LocalStorage, get_storage
+from worker.download import DownloadError, download_video_url, is_youtube_video_url
 from worker.classify import (BUTTONS, CATEGORIES, SUBCATEGORIES,
                              classification_to_record, classify_video,
                              effective_category)
@@ -36,6 +39,15 @@ async def lifespan(_app: FastAPI):
     try:
         db = SessionLocal()
         expire_clips(db, get_storage())
+        # Trabajos que quedaron a medias por un reinicio o un despliegue:
+        # no se reanudan solos; se marcan como error para no dejar un
+        # "processing" eterno en el panel.
+        stale = db.query(Job).filter(Job.status.in_(["queued", "processing"])).all()
+        for j in stale:
+            j.status = "error"
+            j.error = ("Interrumpido por el reinicio del servidor; "
+                       "vuelve a procesar el vídeo.")
+        db.commit()
         db.close()
     except Exception:
         pass
@@ -252,8 +264,31 @@ def correct_video_category(video_id: int, body: CategoryCorrection,
             "dashboard_button": BUTTONS.get(body.category)}
 
 
-@app.post("/api/videos/{video_id}/process")
+def _run_process_in_background(job_id: int):
+    """Ejecuta process_job en un hilo con su propia sesión de BD.
+
+    El endpoint /process responde 202 al instante y el trabajo sigue en
+    segundo plano: en Render el proxy corta las peticiones largas (502),
+    pero el hilo continúa y el panel sondea /api/jobs/{id} hasta ver
+    done/error. process_job ya marca el job como error si falla.
+    """
+    db = SessionLocal()
+    try:
+        from worker.jobs import process_job
+        process_job(db, job_id, get_storage())
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+
+@app.post("/api/videos/{video_id}/process", status_code=202)
 def process_video(video_id: int, db: Session = Depends(get_db)):
+    """Inicia el procesamiento en segundo plano (202 inmediato).
+
+    Antes era síncrono y Render cortaba la petición con 502 en vídeos
+    largos. Ahora el panel sondea GET /api/jobs/{job_id} hasta done/error.
+    """
     v = db.query(Video).filter(Video.id == video_id).one_or_none()
     if not v:
         raise HTTPException(404, "video no encontrado")
@@ -261,15 +296,177 @@ def process_video(video_id: int, db: Session = Depends(get_db)):
     db.add(job)
     db.commit()
     db.refresh(job)
-    # Ejecución síncrona en este MVP (el worker encolado es fase posterior);
-    # el endpoint devuelve el resultado real del pipeline.
-    from worker.jobs import process_job
+    threading.Thread(target=_run_process_in_background, args=(job.id,),
+                     daemon=True).start()
+    return {"job_id": job.id, "status": "queued", "video_id": v.id}
 
+
+# ---------------------------------------------------------------- descarga por enlace
+class FromUrlRequest(BaseModel):
+    url: str
+    auto_process: bool = True
+
+
+def _youtube_cookies_local_path() -> str | None:
+    """Ruta local del archivo de cookies de YouTube, si está configurado.
+
+    En storage local es el propio archivo; en S3 se descarga a ./data/.
+    Devuelve None si no hay cookies subidas. El contenido nunca se
+    expone por ningún endpoint.
+    """
+    storage = get_storage()
+    key = settings.youtube_cookies_key
+    if not storage.exists(key):
+        return None
+    if isinstance(storage, LocalStorage):
+        return str(Path(storage.root) / key)
+    tmp = "./data/cookies_youtube.txt"
+    Path(tmp).write_bytes(storage.read(key))
+    return tmp
+
+
+def _run_download_in_background(job_id: int, url: str, auto_process: bool):
+    """Descarga el vídeo (yt-dlp) y, si auto_process, encadena el proceso.
+
+    Corre en un hilo: la descarga puede tardar minutos y el endpoint
+    responde 202 al instante. El panel sondea el job de descarga y luego
+    el job de proceso (mismo video_id) en /api/jobs.
+    """
+    db = SessionLocal()
+    tmp_dir = Path(f"./data/tmp_download_{job_id}")
     try:
-        result = process_job(db, job.id, get_storage())
-    except Exception as e:
-        raise HTTPException(500, f"procesamiento fallido: {e}")
-    return result
+        job = db.query(Job).filter(Job.id == job_id).one()
+        job.status = "processing"
+        db.commit()
+        cookies_path = _youtube_cookies_local_path()
+        result = download_video_url(
+            url, tmp_dir, cookies_path=cookies_path,
+            max_duration_s=settings.max_download_duration_seconds,
+            max_size_bytes=int(settings.max_upload_gb * 1024 ** 3))
+        data = Path(result["path"]).read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        dup = db.query(Video).filter(Video.sha256 == sha).first()
+        storage = get_storage()
+        if dup:
+            video = dup
+        else:
+            key = f"originals/{sha[:12]}.mp4"
+            storage.save(key, result["path"])
+            video = Video(title=result["title"] or url, source_url=url,
+                          platform="youtube",
+                          duration_seconds=result["duration_seconds"],
+                          file_path=key, file_size_bytes=result["size_bytes"],
+                          sha256=sha)
+            db.add(video)
+            db.commit()
+            db.refresh(video)
+        job.video_id = video.id
+        job.status = "done"
+        db.commit()
+        if auto_process:
+            pjob = Job(video_id=video.id, kind="process", status="queued")
+            db.add(pjob)
+            db.commit()
+            db.refresh(pjob)
+            _run_process_in_background(pjob.id)
+    except DownloadError as e:
+        job = db.query(Job).filter(Job.id == job_id).one_or_none()
+        if job:
+            job.status = "error"
+            job.error = e.message
+            db.commit()
+    except Exception as e:  # noqa: BLE001
+        job = db.query(Job).filter(Job.id == job_id).one_or_none()
+        if job:
+            job.status = "error"
+            job.error = str(e)[:2000]
+            db.commit()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        db.close()
+
+
+@app.post("/api/videos/from-url", status_code=202)
+def video_from_url(body: FromUrlRequest, db: Session = Depends(get_db)):
+    """Descarga un vídeo propio de YouTube por enlace y lo procesa.
+
+    Solo vídeos de YouTube (watch/youtu.be/shorts). Sin cookies, YouTube
+    bloquea la descarga desde servidores en la nube: el job termina en
+    error con el mensaje que explica cómo subir las cookies.
+    """
+    ok, _vid = is_youtube_video_url(body.url)
+    if not ok:
+        raise HTTPException(
+            400, "Solo se admiten enlaces de vídeos de YouTube "
+                 "(watch?v=..., youtu.be/..., shorts/...).")
+    dup = db.query(Video).filter(Video.source_url == body.url).first()
+    if dup:
+        return {"video_id": dup.id, "duplicate_of": dup.id,
+                "title": dup.title, "status": "duplicate"}
+    job = Job(video_id=None, kind="download", status="queued")
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    threading.Thread(target=_run_download_in_background,
+                     args=(job.id, body.url, body.auto_process),
+                     daemon=True).start()
+    return {"job_id": job.id, "status": "queued", "kind": "download"}
+
+
+# ---------------------------------------------------------------- cookies de YouTube
+@app.post("/api/cookies/youtube")
+async def upload_youtube_cookies(file: UploadFile = File(...)):
+    """Guarda el cookies.txt de YouTube del usuario (sesión propia).
+
+    El archivo se guarda en el almacenamiento privado y SOLO lo usa
+    yt-dlp para descargar los vídeos del usuario. Nunca se sirve ni se
+    muestra su contenido por ningún endpoint.
+    """
+    raw = await file.read()
+    if len(raw) > 1024 * 1024:
+        raise HTTPException(413, "El archivo de cookies no puede superar 1 MB")
+    text = raw.decode("utf-8", errors="ignore")
+    lines = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+    yt_lines = [ln for ln in lines if "youtube.com" in ln]
+    if not yt_lines:
+        raise HTTPException(
+            400, "El archivo no contiene cookies de youtube.com. "
+                 "Exporta las cookies estando en youtube.com con tu sesión iniciada.")
+    storage = get_storage()
+    tmp = "./data/cookies_youtube_upload.txt"
+    Path(tmp).write_bytes(raw)
+    storage.save(settings.youtube_cookies_key, tmp)
+    meta = {"uploaded_at": datetime.now(timezone.utc).isoformat(),
+            "youtube_cookies": len(yt_lines), "total_lines": len(lines)}
+    meta_tmp = "./data/cookies_youtube_meta.json"
+    Path(meta_tmp).write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    storage.save(settings.youtube_cookies_meta_key, meta_tmp)
+    os.remove(tmp)
+    os.remove(meta_tmp)
+    return {"uploaded": True, **meta}
+
+
+@app.get("/api/cookies/youtube/status")
+def youtube_cookies_status():
+    """Solo metadatos (existe, fecha, nº de cookies). Nunca el contenido."""
+    storage = get_storage()
+    if not storage.exists(settings.youtube_cookies_key):
+        return {"configured": False}
+    meta: dict = {"configured": True}
+    if storage.exists(settings.youtube_cookies_meta_key):
+        try:
+            meta.update(json.loads(storage.read(settings.youtube_cookies_meta_key).decode("utf-8")))
+        except Exception:
+            pass
+    return meta
+
+
+@app.delete("/api/cookies/youtube")
+def delete_youtube_cookies():
+    storage = get_storage()
+    storage.delete(settings.youtube_cookies_key)
+    storage.delete(settings.youtube_cookies_meta_key)
+    return {"deleted": True}
 
 
 @app.get("/api/jobs")
