@@ -129,10 +129,8 @@
       <video id="player" controls preload="metadata" style="max-width:100%"></video>
       <p id="player-title" class="hint"></p>
     </div>
-    <p class="hint"><strong>Miniaturas:</strong> no hay endpoint de miniaturas en la API
-    (<code>thumbnail_path</code> existe en la BD y el worker genera <code>thumbs/{id}.jpg</code>,
-    pero ningún endpoint lo sirve). Cada clip muestra un marcador con su duración y puntuación.
-    Pendiente: exponer <code>GET /api/clips/{id}/thumbnail</code>.</p>
+    <p class="hint"><strong>Miniaturas:</strong> servidas por <code>GET /api/clips/{id}/thumbnail</code>
+    (200 <code>image/jpeg</code>; 404 si no existe, 410 si el clip caducó).</p>
   </section>
 
   <!-- 4. COLA Y MOMENTOS -->
@@ -160,14 +158,14 @@
     <table class="limits">
       <thead><tr><th>Servicio</th><th>Límite gratuito documentado</th><th>Qué pasa al agotarse</th><th>Fuente</th></tr></thead>
       <tbody>
-        <tr><td>Cloudflare R2 (almacenamiento)</td><td>10 GB gratis; salida 0 $; más allá: 0,015 $/GB-mes</td><td>Pausa de nuevas subidas/trabajos; borrado a 7 días libera espacio</td><td>PRESUPUESTO §1 / §4.2</td></tr>
+        <tr><td>Supabase Storage (almacenamiento)</td><td>1 GB gratis en el plan Free</td><td>Pausa de nuevas subidas/trabajos; borrado a 7 días libera espacio</td><td>DESPLIEGUE §3.2</td></tr>
         <tr><td>YouTube Data API v3</td><td>10.000 unidades/día, no comprable</td><td>Pausa de sondeo/importación hasta medianoche (hora del Pacífico)</td><td>PRESUPUESTO §1; ARQ. §5</td></tr>
         <tr><td>Twitch Helix</td><td>800 puntos/min, gratis</td><td>Reducir frecuencia de sondeo</td><td>PRESUPUESTO §1</td></tr>
         <tr><td>Kick API</td><td>Gratis; sin límite REST publicado (429 + Retry-After)</td><td>Respetar Retry-After</td><td>PRESUPUESTO §1</td></tr>
         <tr><td>Groq Whisper (plan gratis)</td><td>8 h de audio/día; archivos &lt;25 MB; sin tarjeta</td><td>Los trabajos pasan a faster-whisper en CPU</td><td>ARQ. §3.7 / §5</td></tr>
         <tr><td>faster-whisper (autoalojado)</td><td>Licencia MIT, 0 $; cómputo en el host</td><td>Más latencia (0,7–2,5× tiempo real en CPU), no más coste</td><td>ARQ. §3.7</td></tr>
-        <tr><td>Neon Postgres Free (si se usa)</td><td>~100 CU-horas/proyecto/mes; 0,5 GB (cifra menor)</td><td>La BD deja de responder hasta el mes siguiente</td><td>ARQ. §3.4 / §5</td></tr>
-        <tr><td>Oracle Always Free ARM (host 0 $)</td><td>2 OCPU / 12 GB; 200 GB bloque; 10 TB salida/mes</td><td>Sin host: cae la plataforma; no hay cargo, hay caída. Riesgo de reclamación si CPU+red+memoria &lt;20% durante 7 días</td><td>ARQ. §3.1 / §5</td></tr>
+        <tr><td>Supabase Postgres Free (base de datos)</td><td>500 MB de BD en el plan Free; el proyecto se pausa tras 1 semana sin uso (se reactiva con un clic)</td><td>La BD deja de responder hasta reactivarla</td><td>DESPLIEGUE §3.2</td></tr>
+        <tr><td>Render Free (host)</td><td>512 MB de RAM; duerme a los 15 min sin tráfico (la primera visita tarda ~1 min en despertar)</td><td>Sin host: cae la plataforma; no hay cargo, hay caída</td><td>DESPLIEGUE §3.2</td></tr>
         <tr><td>Modal (crédito 30 $/mes)</td><td><strong>FUERA del camino 0 $</strong>: exige tarjeta para casi todo el crédito</td><td>No se usa en esta V2; cualquier uso futuro es decisión aparte del usuario</td><td>ARQ. §0</td></tr>
       </tbody>
     </table>
@@ -175,7 +173,7 @@
     <ul class="list">
       <li><strong>Gasto GPU en tiempo real:</strong> no disponible — no existe endpoint ni libro de gasto (<code>usage_ledger</code>) en la API actual. En el camino 0 $ no hay GPU: el cómputo es CPU del host. Pendiente: registrar GPU-segundos por trabajo si algún día se usa GPU.</li>
       <li><strong>Horas procesadas / consumo de API por día:</strong> no disponible — la API no expone contadores de YouTube/Twitch/Groq. El panel muestra los límites, no un consumo inventado.</li>
-      <li><strong>Gasto mensual en USD:</strong> 0 $ real en el camino 0 $ (host Oracle Always Free + R2 dentro de 10 GB + faster-whisper en CPU). No hay factura que consultar: no existe integración verificada de facturación de ningún proveedor (PRESUPUESTO §5).</li>
+      <li><strong>Gasto mensual en USD:</strong> 0 $ real en el camino 0 $ (host Render Free + Supabase dentro de 1 GB de almacenamiento + faster-whisper tiny en CPU). No hay factura que consultar: no existe integración verificada de facturación de ningún proveedor (PRESUPUESTO §5).</li>
     </ul>
     <p class="hint">Configuración real del servidor (desde <code>/health</code> y <code>viralclip/config.py</code>):
     <span id="config-line">—</span></p>
