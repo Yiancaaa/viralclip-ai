@@ -8,7 +8,7 @@ apscheduler==3.11.0
 httpx==0.28.1
 boto3==1.35.90
 psycopg2-binary==2.9.10  # driver Postgres para DATABASE_URL=postgresql://... (despliegue; SQLite no lo necesita)
-streamlink==7.2.0
+streamlink==8.6.3
 yt-dlp==2026.11.23  # descarga por enlace (YouTube, vídeos propios); requiere un runtime JS (nodejs en Dockerfile)
 faster-whisper==1.2.1
 av==13.1.0  # faster-whisper 1.2.1 usa av.open(metadata_errors=...); av>=14 lo rompe
