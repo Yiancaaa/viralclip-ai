@@ -28,7 +28,11 @@ class Settings(BaseSettings):
     whisper_model: str = "small"
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
-    # Límites (PRESUPUESTO 0 $: nada de pago por defecto)
+    # Descarga por enlace (YouTube, vídeos propios): duración máxima
+    # de un vídeo descargado y clave del archivo de cookies en storage.
+    max_download_duration_seconds: int = 7200  # 2 h
+    youtube_cookies_key: str = "cookies/youtube_cookies.txt"
+    youtube_cookies_meta_key: str = "cookies/youtube_meta.json"
     max_concurrent_streams: int = 3
     default_active_streams: int = 1
     clip_retention_days: int = 7
