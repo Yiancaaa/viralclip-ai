@@ -29,6 +29,13 @@ class Storage(ABC):
     def size_bytes(self, key: str) -> int:
         ...
 
+    @abstractmethod
+    def presigned_put_url(self, key: str, content_type: str = "video/mp4",
+                          expires_in: int = 3600) -> str:
+        """URL prefirmada para que un cliente suba DIRECTO al bucket con
+        PUT, sin pasar por el proceso web. Lanza NotImplementedError si
+        el backend no lo soporta (p. ej. almacenamiento local)."""
+
 
 class LocalStorage(Storage):
     def __init__(self, root: str | Path):
@@ -66,6 +73,15 @@ class LocalStorage(Storage):
 
     def total_used_bytes(self) -> int:
         return sum(f.stat().st_size for f in self.root.rglob("*") if f.is_file())
+
+    def presigned_put_url(self, key: str, content_type: str = "video/mp4",
+                          expires_in: int = 3600) -> str:
+        # El almacenamiento local no tiene URLs prefirmadas: la subida
+        # directa solo existe con S3. La API responde 501 y el panel
+        # usa la subida clásica multipart como reserva.
+        raise NotImplementedError(
+            "presigned_put_url no disponible en almacenamiento local; "
+            "usa la subida clásica (multipart) o configura el backend S3")
 
 
 class S3Storage(Storage):
@@ -117,6 +133,22 @@ class S3Storage(Storage):
             return self.client.head_object(Bucket=self.bucket, Key=key)["ContentLength"]
         except Exception:
             return 0
+
+    def presigned_put_url(self, key: str, content_type: str = "video/mp4",
+                          expires_in: int = 3600) -> str:
+        """URL prefirmada (SigV4) para un PUT directo al bucket.
+
+        El navegador sube el archivo a esta URL con el MISMO
+        Content-Type que se firma aquí; el proceso web no ve ni un
+        byte del archivo (no hay lectura en RAM ni proxy de Render de
+        por medio). Válida `expires_in` segundos.
+        """
+        return self.client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": self.bucket, "Key": key,
+                    "ContentType": content_type},
+            ExpiresIn=int(expires_in),
+        )
 
 
 def get_storage() -> Storage:
