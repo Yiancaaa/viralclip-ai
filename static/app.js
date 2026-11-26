@@ -203,15 +203,110 @@ document.querySelectorAll(".cat-btn").forEach((b) => b.addEventListener("click",
   await setManualCategory(valid, SUBCATEGORIES[valid][0]);
 }));
 
+/* ---------- sondeo de trabajos en segundo plano ---------- */
+// Los endpoints /process y /from-url responden 202 al instante y el
+// trabajo sigue en un hilo del servidor (Render corta las peticiones
+// largas con 502). El panel sondea GET /api/jobs/{id} hasta done/error.
+async function pollJob(jobId, box, label) {
+  for (let i = 0; i < 480; i++) {
+    const j = await api(`/api/jobs/${jobId}`);
+    if (j.status === "done") return j;
+    if (j.status === "error") throw new Error(j.error || "El trabajo terminó con error");
+    if (box) box.textContent = `${label} · estado: ${j.status}… (puede tardar varios minutos, no cierres la página)`;
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+  throw new Error("Tiempo de espera agotado sondeando el trabajo");
+}
+
 $("#btn-process").addEventListener("click", async () => {
   if (!currentVideoId) return;
   const box = $("#process-result");
-  box.textContent = "Procesando… (síncrono en el servidor: transcripción + momentos + render; puede tardar varios minutos en un fragmento largo). No cierres la página.";
+  box.textContent = "Procesando en segundo plano…";
   try {
     const r = await api(`/api/videos/${currentVideoId}/process`, { method: "POST" });
-    box.textContent = `Job #${r.job_id} · estado: ${r.status} · momentos: ${r.moments} · clips: ${r.clips ? r.clips.length : 0} · categoría usada: ${r.category} (origen: ${r.category_source})`;
+    box.textContent = `Job #${r.job_id} en cola…`;
+    const j = await pollJob(r.job_id, box, "Procesando");
+    box.textContent = `Job #${j.id} · estado: ${j.status} · momentos: ${(j.moments || []).length} · clips listos en Mi biblioteca.`;
     await loadLibrary(); await loadJobs();
   } catch (e) { box.textContent = "Error al procesar: " + e.message; }
+});
+
+/* ---------- descargar por enlace (YouTube) ---------- */
+$("#fromurl-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const url = $("#fromurl-url").value.trim();
+  const box = $("#fromurl-result");
+  box.textContent = "Descargando el vídeo… (puede tardar varios minutos según su tamaño)";
+  try {
+    const r = await api("/api/videos/from-url", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, auto_process: true }),
+    });
+    if (r.status === "duplicate") {
+      box.textContent = `Ese vídeo ya existe (#${r.video_id}). Sus clips están en Mi biblioteca.`;
+      currentVideoId = r.video_id;
+      await loadLibrary(); await loadJobs();
+      return;
+    }
+    const dl = await pollJob(r.job_id, box, "Descargando");
+    const videoId = dl.video_id;
+    if (!videoId) throw new Error("La descarga terminó sin vídeo (revisa la cola).");
+    box.textContent = `Vídeo #${videoId} descargado. Procesando…`;
+    currentVideoId = videoId;
+    $("#video-panel").hidden = false;
+    $("#video-id-label").textContent = "#" + videoId;
+    await loadVideo(videoId);
+    // El job de proceso se crea al terminar la descarga; puede tardar
+    // unos segundos en aparecer en /api/jobs.
+    let pj = null;
+    for (let i = 0; i < 5 && !pj; i++) {
+      const jobs = await api("/api/jobs");
+      pj = jobs.find((j) => j.video_id === videoId && j.kind === "process");
+      if (!pj) await new Promise((r) => setTimeout(r, 2000));
+    }
+    if (pj) {
+      const done = await pollJob(pj.id, box, "Procesando");
+      box.textContent = `Listo: vídeo #${videoId} procesado · momentos: ${(done.moments || []).length} · clips en Mi biblioteca.`;
+    } else {
+      box.textContent = `Vídeo #${videoId} descargado. Pulsa «Procesar» en «Subir vídeo propio» si no se procesó solo.`;
+    }
+    await loadLibrary(); await loadJobs();
+  } catch (e) { box.textContent = "Error: " + e.message; }
+});
+
+/* ---------- cookies de YouTube ---------- */
+async function loadCookiesStatus() {
+  const el = $("#cookies-status");
+  try {
+    const s = await api("/api/cookies/youtube/status");
+    el.textContent = s.configured
+      ? `Cookies: configuradas · subidas: ${s.uploaded_at || "—"} · cookies de YouTube: ${s.youtube_cookies ?? "—"}`
+      : "Cookies: no configuradas (sin ellas, YouTube bloquea la descarga).";
+  } catch (e) { el.textContent = "Cookies: no se pudo comprobar (" + e.message + ")"; }
+}
+$("#cookies-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const file = $("#cookies-file").files[0];
+  if (!file) return;
+  const box = $("#cookies-result");
+  box.textContent = "Subiendo cookies…";
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const r = await fetch("/api/cookies/youtube", { method: "POST", body: fd });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    box.textContent = `Cookies guardadas · ${data.youtube_cookies} cookies de YouTube · subidas: ${data.uploaded_at}`;
+    await loadCookiesStatus();
+  } catch (e) { box.textContent = "Error al subir cookies: " + e.message; }
+});
+$("#btn-cookies-delete").addEventListener("click", async () => {
+  if (!confirm("¿Eliminar las cookies de YouTube guardadas? Las descargas por enlace dejarán de funcionar hasta subir unas nuevas.")) return;
+  try {
+    await api("/api/cookies/youtube", { method: "DELETE" });
+    $("#cookies-result").textContent = "Cookies eliminadas.";
+    await loadCookiesStatus();
+  } catch (e) { $("#cookies-result").textContent = "Error: " + e.message; }
 });
 
 /* ---------- biblioteca ---------- */
@@ -219,8 +314,8 @@ function clipCard(c) {
   const remaining = c.seconds_remaining ?? 0;
   const soon = remaining > 0 && remaining < 86400;
   return `<article class="clip" data-clip-id="${c.id}" data-remaining="${remaining}">
-    <div class="thumb-placeholder" aria-label="Sin miniatura disponible">
-      <span>Sin miniatura<br>(pendiente endpoint)</span>
+    <div class="thumb-placeholder" aria-label="Miniatura del clip">
+      <img src="/api/clips/${c.id}/thumbnail" alt="Miniatura del clip" loading="lazy" style="max-width:100%;display:block" onerror="this.outerHTML='<span>Sin miniatura<br>(no disponible)</span>'">
       <strong>${fmtSecs(c.duration_seconds)} · ★ ${c.score}</strong>
     </div>
     <h4>${esc(c.title || "Clip #" + c.id)}</h4>
@@ -328,12 +423,12 @@ async function loadQuota() {
       `<div class="bar"><div style="width:${Math.min(100, pct)}%"></div></div>`;
     alerts.innerHTML = "";
     if (pct >= 100) alerts.innerHTML = `<p class="alert danger">⛔ Cuota agotada (100%): nuevas subidas/trabajos en pausa hasta liberar espacio. El sistema no genera cargos.</p>`;
-    else if (pct >= 80) alerts.innerHTML = `<p class="alert warn">⚠ Uso por encima del 80% (${pct}%): aviso + sugerencia de limpieza. Al superar 10 GB retenidos el coste dejaría de ser 0 $ (0,015 $/GB-mes).</p>`;
-    else alerts.innerHTML = `<p class="alert ok">✓ Dentro del tramo gratuito de R2 (10 GB). Gasto mensual real: 0 $.</p>`;
+    else if (pct >= 80) alerts.innerHTML = `<p class="alert warn">⚠ Uso por encima del 80% (${pct}%): aviso + sugerencia de limpieza. Al superar 1 GB, las subidas se pausan hasta liberar espacio (el borrado a 7 días libera espacio).</p>`;
+    else alerts.innerHTML = `<p class="alert ok">✓ Dentro del tramo gratuito de Supabase (1 GB). Gasto mensual real: 0 $.</p>`;
   } catch (e) { box.textContent = "No se pudo cargar la cuota: " + e.message; }
 }
 
 /* ---------- inicio ---------- */
-loadHealth(); loadStreams(); loadLibrary(); loadJobs(); loadQuota();
+loadHealth(); loadStreams(); loadLibrary(); loadJobs(); loadQuota(); loadCookiesStatus();
 setInterval(loadQuota, 60000);
 setInterval(loadLibrary, 60000);

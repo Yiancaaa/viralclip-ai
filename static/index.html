@@ -18,6 +18,7 @@
 <nav class="tabs" aria-label="Secciones">
   <a href="#analizar">Analizar directo</a>
   <a href="#subida">Subir vídeo</a>
+  <a href="#enlace">Descargar por enlace</a>
   <a href="#biblioteca">Mi biblioteca</a>
   <a href="#cola">Cola y momentos</a>
   <a href="#costes">Costes</a>
@@ -31,6 +32,9 @@
     <code>POST /api/streams/validate</code> y luego se crea la sesión con <code>POST /api/streams</code>.
     El estado en vivo es el que devuelve la API: sin credenciales de plataforma la API responde
     <code>requires_credentials</code> y así se muestra — nunca se inventa un «en vivo».</p>
+    <p class="hint"><strong>Para vídeos ya publicados</strong> (no en directo) usa
+    <a href="#enlace">Descargar por enlace</a> o <a href="#subida">Subir vídeo propio</a>:
+    un enlace pegado aquí solo crea la sesión, no descarga ni procesa el vídeo.</p>
     <form id="stream-form" class="row">
       <input id="stream-url" type="url" placeholder="https://www.twitch.tv/tu_canal" required aria-label="URL del directo">
       <select id="stream-platform" aria-label="Plataforma">
@@ -101,6 +105,43 @@
       </fieldset>
       <div id="process-result" class="result" aria-live="polite"></div>
     </div>
+  </section>
+
+  <!-- 2b. DESCARGAR POR ENLACE (YOUTUBE) -->
+  <section id="enlace" class="card">
+    <h2>🔗 Descargar por enlace (YouTube)</h2>
+    <p class="hint">Pega el enlace de <strong>tu propio vídeo</strong> de YouTube y la página lo
+    descarga y lo procesa, como OpusClip. Solo vídeos propios o autorizados.
+    YouTube no entrega el vídeo por ninguna API oficial, así que la descarga usa
+    yt-dlp; desde un servidor en la nube YouTube la bloquea sin sesión, por eso
+    hacen falta tus cookies (abajo). Límite: 2 h de duración, 2 GB.</p>
+    <form id="fromurl-form" class="row">
+      <input id="fromurl-url" type="url" placeholder="https://www.youtube.com/watch?v=..." required aria-label="URL del vídeo de YouTube">
+      <button type="submit" id="btn-fromurl">Descargar y procesar</button>
+    </form>
+    <div id="fromurl-result" class="result" aria-live="polite"></div>
+
+    <h3>Cookies de YouTube (necesarias para descargar)</h3>
+    <p class="hint">Sin estas cookies, YouTube responde «confirma que no eres un robot» y la
+    descarga falla. Son <strong>tu sesión de Google</strong>: solo se usan para descargar
+    tus vídeos y nunca se muestran ni se comparten. Caduca cada cierto tiempo: si una
+    descarga falla con ese mensaje, vuelve a exportarlas.</p>
+    <details>
+      <summary>Cómo exportar tus cookies (una vez)</summary>
+      <ol>
+        <li>En Chrome, instala la extensión <strong>Get cookies.txt LOCALLY</strong>.</li>
+        <li>Abre <strong>youtube.com</strong> con tu sesión iniciada.</li>
+        <li>Pulsa el icono de la extensión y exporta el archivo <code>cookies.txt</code>.</li>
+        <li>Súbelo aquí abajo con el botón «Subir cookies».</li>
+      </ol>
+    </details>
+    <form id="cookies-form" class="row">
+      <input id="cookies-file" type="file" accept=".txt" required aria-label="Archivo cookies.txt">
+      <button type="submit" id="btn-cookies">Subir cookies</button>
+      <button type="button" id="btn-cookies-delete">Eliminar cookies</button>
+    </form>
+    <div id="cookies-result" class="result" aria-live="polite"></div>
+    <p id="cookies-status" class="hint">Cookies: comprobando…</p>
   </section>
 
   <!-- 3. BIBLIOTECA -->
