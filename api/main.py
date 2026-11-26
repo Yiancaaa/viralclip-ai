@@ -23,6 +23,10 @@ from viralclip.db import SessionLocal, init_db
 from viralclip.models import Clip, Job, LiveSession, Moment, Video
 from viralclip.storage import LocalStorage, get_storage
 from worker.download import DownloadError, download_video_url, is_youtube_video_url
+from worker.upload import (PRESIGNED_URL_EXPIRES_SECONDS,
+                           UploadTooLargeError, build_upload_key,
+                           presign_direct_upload, register_uploaded_video,
+                           validate_upload_request)
 from worker.classify import (BUTTONS, CATEGORIES, SUBCATEGORIES,
                              classification_to_record, classify_video,
                              effective_category)
@@ -171,15 +175,135 @@ async def upload_video(file: UploadFile = File(...), title: str = "",
     return {"id": v.id, "title": v.title, "file_path": key, "size_bytes": len(data)}
 
 
+# ---------------------------------------------------------------- subida directa a S3 (URL prefirmada)
+class PresignRequest(BaseModel):
+    filename: str
+    size_bytes: int
+    sha256: str
+    title: str = ""
+    duration_seconds: float = 0.0
+    content_type: str = "video/mp4"
+
+
+@app.post("/api/videos/upload/presign")
+def presign_upload(body: PresignRequest, db: Session = Depends(get_db)):
+    """URL prefirmada para subir el archivo DIRECTO a S3 (PUT).
+
+    El navegador sube a esa URL sin pasar por el proceso web: el
+    endpoint clásico lee el archivo entero en RAM y pasa por el proxy
+    de Render, y una subida de un vídeo de Studio llevaba 1 hora sin
+    llegar nunca (verificado 2026-11-26). Valida tamaño, SHA-256,
+    extensión, duplicado y cuota ANTES de devolver la URL. Si el vídeo
+    ya existe (mismo SHA-256) responde duplicate y no hace falta subir
+    nada. 501 si el backend no soporta URLs prefirmadas (local): el
+    panel usa entonces la subida clásica como reserva.
+    """
+    max_size = int(settings.max_upload_gb * 1024 ** 3)
+    try:
+        suffix = validate_upload_request(
+            body.filename, body.size_bytes, body.sha256,
+            body.duration_seconds,
+            max_size_bytes=max_size,
+            max_duration_seconds=settings.max_download_duration_seconds)
+    except UploadTooLargeError as e:
+        raise HTTPException(413, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    dup = db.query(Video).filter(Video.sha256 == body.sha256).first()
+    if dup:
+        return {"duplicate": True, "duplicate_of": dup.id, "video_id": dup.id,
+                "title": dup.title}
+    storage = get_storage()
+    if isinstance(storage, LocalStorage):
+        used = storage.total_used_bytes()
+    else:
+        used = sum(c.file_size_bytes for c in
+                   db.query(Clip).filter(Clip.expired.is_(False)).all())
+    limit = int(settings.storage_quota_gb * 1024 ** 3)
+    if used + body.size_bytes > limit:
+        raise HTTPException(
+            413, f"Cuota de almacenamiento llena: {used / 1024 ** 3:.2f} GB "
+                 f"usados de {settings.storage_quota_gb:.0f} GB; el archivo "
+                 f"necesita {body.size_bytes / 1024 ** 2:.0f} MB más.")
+    key = build_upload_key(body.sha256, suffix)
+    try:
+        url = presign_direct_upload(
+            storage, key, content_type=body.content_type or "video/mp4")
+    except NotImplementedError as e:
+        raise HTTPException(501, str(e))
+    return {"upload_url": url, "key": key,
+            "expires_in": PRESIGNED_URL_EXPIRES_SECONDS,
+            "content_type": body.content_type or "video/mp4",
+            "max_upload_gb": settings.max_upload_gb}
+
+
+class CompleteUploadRequest(BaseModel):
+    key: str
+    sha256: str
+    filename: str
+    title: str = ""
+    size_bytes: int
+    duration_seconds: float = 0.0
+
+
+@app.post("/api/videos/upload/complete")
+def complete_upload(body: CompleteUploadRequest, db: Session = Depends(get_db)):
+    """Registra en BD un vídeo ya subido directo a S3.
+
+    Verifica que la clave es la derivada del SHA-256 declarado, que el
+    objeto existe y que su tamaño coincide (detecta subidas truncadas).
+    Deduplica por SHA-256 como el endpoint clásico.
+    """
+    try:
+        video, dup = register_uploaded_video(
+            db, get_storage(), key=body.key, sha256=body.sha256,
+            filename=body.filename, title=body.title,
+            size_bytes=body.size_bytes,
+            duration_seconds=body.duration_seconds)
+    except UploadTooLargeError as e:
+        raise HTTPException(413, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    out = _video_dict(video)
+    out["duplicate"] = dup
+    out["duplicate_of"] = video.id if dup else None
+    return out
+
+
 def _video_dict(v: Video) -> dict:
     category, source = effective_category(v)
     return {"id": v.id, "title": v.title, "platform": v.platform,
             "duration_seconds": v.duration_seconds, "file_path": v.file_path,
+            "file_size_bytes": v.file_size_bytes or 0,
+            "created_at": v.created_at.isoformat() if v.created_at else None,
             "category": v.category or "", "subcategory": v.subcategory or "",
             "classification_confidence": v.classification_confidence or 0.0,
             "classification_source": v.classification_source or "",
             "manual_override": bool(v.manual_override),
             "effective_category": category, "effective_category_source": source}
+
+
+@app.get("/api/videos")
+def list_videos(db: Session = Depends(get_db)):
+    """Lista de vídeos subidos/descargados, más recientes primero, con
+    el estado de su último trabajo de proceso y el nº de clips.
+
+    No existía (daba 404): el panel no podía mostrar los vídeos
+    subidos ni su estado.
+    """
+    out = []
+    for v in db.query(Video).order_by(Video.id.desc()).all():
+        d = _video_dict(v)
+        latest = (db.query(Job)
+                  .filter(Job.video_id == v.id, Job.kind == "process")
+                  .order_by(Job.id.desc()).first())
+        d["process_status"] = latest.status if latest else "sin_procesar"
+        d["latest_process_job_id"] = latest.id if latest else None
+        d["clips_count"] = len(v.clips)
+        out.append(d)
+    return out
 
 
 @app.get("/api/videos/{video_id}")
