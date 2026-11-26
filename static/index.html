@@ -61,15 +61,26 @@
   <!-- 2. SUBIDA + CLASIFICACIÓN -->
   <section id="subida" class="card">
     <h2>⬆ Subir vídeo propio</h2>
-    <p class="hint">Subida directa (multipart) a <code>POST /api/videos/upload</code>. La API deduplica
-    por SHA-256: si el archivo ya existe devuelve <code>duplicate_of</code>. Límite: 2 GB
-    (<code>MAX_UPLOAD_GB</code>).</p>
+    <p class="hint">Subida <strong>directa a S3</strong>: el navegador sube el archivo directo al
+    almacenamiento con una URL prefirmada (<code>POST /api/videos/upload/presign</code> →
+    PUT directo → <code>POST /api/videos/upload/complete</code>), sin pasar por el proceso
+    web. La subida clásica (multipart a <code>POST /api/videos/upload</code>) queda como
+    reserva si la directa no está disponible. La API deduplica por SHA-256: si el archivo
+    ya existe no hace falta subirlo otra vez. Límite: 2 GB (<code>MAX_UPLOAD_GB</code>).</p>
     <form id="upload-form" class="row">
       <input id="upload-file" type="file" accept="video/*" required aria-label="Archivo de vídeo">
       <input id="upload-title" type="text" placeholder="Título (opcional)" aria-label="Título">
       <button type="submit" id="btn-upload">Subir</button>
     </form>
+    <progress id="upload-progress" max="100" value="0" hidden style="width:100%" aria-label="Progreso de subida"></progress>
     <div id="upload-result" class="result" aria-live="polite"></div>
+
+    <h3>Mis vídeos subidos</h3>
+    <p class="hint">Desde <code>GET /api/videos</code>: los vídeos subidos o descargados, con su
+    estado de proceso y el nº de clips. Pulsa «Seleccionar» para cargarlo en el panel de
+    abajo y procesarlo.</p>
+    <ul id="videos-list" class="list"></ul>
+    <button id="btn-refresh-videos" type="button">Actualizar vídeos</button>
 
     <div id="video-panel" hidden>
       <h3>Vídeo <span id="video-id-label"></span></h3>
