@@ -51,7 +51,11 @@ docker compose up --build
 | PATCH | `/api/videos/{id}/category` | Corrección manual de la categoría (sin reintroducir la URL; tiene prioridad) |
 | GET | `/api/videos/{id}` | Vídeo + estado de clasificación (categoría efectiva, confianza, fuente) |
 | POST | `/api/videos/upload` | Subida directa (multipart); deduplica por SHA-256 |
-| POST | `/api/videos/{id}/process` | Ejecuta el pipeline real (transcribe → detecta → puntúa → titula → renderiza) |
+| POST | `/api/videos/from-url` | Descarga un vídeo propio de YouTube por enlace (yt-dlp, 202 + job `download`); con `auto_process` encadena el proceso. Sin cookies de YouTube, YouTube bloquea la descarga (ver `worker/download.py`) |
+| POST | `/api/videos/{id}/process` | Inicia el pipeline en segundo plano (202 inmediato); el panel sondea `GET /api/jobs/{id}` hasta done/error |
+| POST | `/api/cookies/youtube` | Sube el `cookies.txt` de YouTube del usuario (sesión propia; solo lo usa yt-dlp; nunca se sirve su contenido) |
+| GET | `/api/cookies/youtube/status` | Solo metadatos de las cookies (existe, fecha, nº de cookies) |
+| DELETE | `/api/cookies/youtube` | Elimina las cookies guardadas |
 | GET | `/api/jobs` · `/api/jobs/{id}` | Trabajos y sus momentos |
 | GET | `/api/moments?min_score=` | Momentos ordenados por puntuación, con desglose |
 | GET | `/api/clips` · `/api/library` | Biblioteca; filtros: `q`, `platform`, `min_score`, `favorites_only`, `min_duration`, `max_duration`, `date_from`, `date_to`; incluye `expires_at` y `seconds_remaining` |
@@ -262,8 +266,11 @@ storage S3 de Supabase no funcionan. La app no se modificó en nada más.
   El caso de uso correcto es metraje en bruto / directo sin texto
   quemado; detectar texto quemado en el origen queda como mejora
   futura (no implementada).
-- **Worker encolado asíncrono (Redis/RQ):** `POST /process` ejecuta el pipeline
-  de forma síncrona; la cola persistente con reintentos es fase posterior.
+- **Worker encolado asíncrono (Redis/RQ):** la cola persistente con reintentos
+  es fase posterior. Desde 2026-11-26, `POST /process` y `/from-url`
+  responden 202 y el trabajo corre en un hilo del proceso (ver
+  `api/main.py` → `_run_process_in_background`); al arrancar, los jobs
+  `queued`/`processing` de un despliegue anterior se marcan como error.
 - **Frontend / dashboard:** solo API REST (sin UI).
 - **Autenticación de usuarios y tokens OAuth cifrados:** no hay auth; las
   credenciales de plataforma van por variables de entorno.

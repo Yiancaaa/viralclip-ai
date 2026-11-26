@@ -1,7 +1,9 @@
 FROM python:3.12-slim
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core nodejs \
     && rm -rf /var/lib/apt/lists/*
+# nodejs: runtime JS para yt-dlp (sin él, la extracción de YouTube queda
+# degradada y algunos formatos faltan).
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
