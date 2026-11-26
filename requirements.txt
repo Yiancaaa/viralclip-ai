@@ -1,0 +1,15 @@
+fastapi==0.115.6
+uvicorn==0.34.0
+sqlalchemy==2.0.36
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-multipart==0.0.20
+apscheduler==3.11.0
+httpx==0.28.1
+boto3==1.35.90
+psycopg2-binary==2.9.10  # driver Postgres para DATABASE_URL=postgresql://... (despliegue; SQLite no lo necesita)
+streamlink==7.2.0
+faster-whisper==1.2.1
+av==13.1.0  # faster-whisper 1.2.1 usa av.open(metadata_errors=...); av>=14 lo rompe
+opencv-python-headless==4.11.0.86  # clasificación: rostros Haar + movimiento (sin GUI, 0 $)
+pytest==8.3.4

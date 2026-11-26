@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VIRALCLIP AI — Dashboard</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>VIRALCLIP AI</h1>
+    <p class="sub">Clips verticales 9:16 de tus directos · Presupuesto 0 $ · Solo contenido propio/autorizado</p>
+  </div>
+  <div id="health" class="health" data-state="unknown">API: comprobando…</div>
+</header>
+
+<nav class="tabs" aria-label="Secciones">
+  <a href="#analizar">Analizar directo</a>
+  <a href="#subida">Subir vídeo</a>
+  <a href="#biblioteca">Mi biblioteca</a>
+  <a href="#cola">Cola y momentos</a>
+  <a href="#costes">Costes</a>
+</nav>
+
+<main>
+  <!-- 1. ANALIZAR DIRECTO -->
+  <section id="analizar" class="card">
+    <h2>▶ Analizar directo</h2>
+    <p class="hint">Pega la URL de tu directo (Twitch, Kick o YouTube). Primero se valida con
+    <code>POST /api/streams/validate</code> y luego se crea la sesión con <code>POST /api/streams</code>.
+    El estado en vivo es el que devuelve la API: sin credenciales de plataforma la API responde
+    <code>requires_credentials</code> y así se muestra — nunca se inventa un «en vivo».</p>
+    <form id="stream-form" class="row">
+      <input id="stream-url" type="url" placeholder="https://www.twitch.tv/tu_canal" required aria-label="URL del directo">
+      <select id="stream-platform" aria-label="Plataforma">
+        <option value="auto">Plataforma: automática (según URL)</option>
+        <option value="twitch">Twitch</option>
+        <option value="kick">Kick</option>
+        <option value="youtube">YouTube</option>
+      </select>
+      <button type="submit" id="btn-analyze">Iniciar análisis</button>
+    </form>
+    <div id="validate-result" class="result" aria-live="polite"></div>
+    <div class="row stats">
+      <span>Estado de conexión: <strong id="conn-state">—</strong></span>
+      <span>En vivo (API): <strong id="live-state">—</strong></span>
+      <span>Tiempo de análisis: <strong id="analysis-timer">00:00</strong></span>
+    </div>
+    <h3>Sesiones de análisis</h3>
+    <p class="hint">Máx. 3 directos simultáneos (1 activo por defecto, resto en espera). Puedes añadir
+    otro enlace y gestionar cada análisis por separado.</p>
+    <ul id="streams-list" class="list"></ul>
+    <button id="btn-refresh-streams" type="button">Actualizar sesiones</button>
+  </section>
+
+  <!-- 2. SUBIDA + CLASIFICACIÓN -->
+  <section id="subida" class="card">
+    <h2>⬆ Subir vídeo propio</h2>
+    <p class="hint">Subida directa (multipart) a <code>POST /api/videos/upload</code>. La API deduplica
+    por SHA-256: si el archivo ya existe devuelve <code>duplicate_of</code>. Límite: 2 GB
+    (<code>MAX_UPLOAD_GB</code>).</p>
+    <form id="upload-form" class="row">
+      <input id="upload-file" type="file" accept="video/*" required aria-label="Archivo de vídeo">
+      <input id="upload-title" type="text" placeholder="Título (opcional)" aria-label="Título">
+      <button type="submit" id="btn-upload">Subir</button>
+    </form>
+    <div id="upload-result" class="result" aria-live="polite"></div>
+
+    <div id="video-panel" hidden>
+      <h3>Vídeo <span id="video-id-label"></span></h3>
+      <p id="video-info" class="hint"></p>
+      <div class="row">
+        <button id="btn-classify" type="button">Detectar categoría automáticamente</button>
+        <button id="btn-process" type="button">Procesar (momentos + clips)</button>
+      </div>
+      <div id="classify-result" class="result" aria-live="polite"></div>
+
+      <fieldset>
+        <legend>Categoría (la selección manual tiene prioridad sobre la automática)</legend>
+        <div class="row">
+          <button type="button" class="cat-btn" data-category="gameplay_streamer">🎮 Gameplay / Streamer</button>
+          <button type="button" class="cat-btn" data-category="podcast_entrevista">🎙 Podcast / Reality / Conversación</button>
+        </div>
+        <p class="hint">El botón «Podcast / Reality / Conversación» agrupa
+        <code>podcast_entrevista</code>, <code>reality_casa</code> y
+        <code>conversacion_reaccion</code> (ver <code>worker/classify.py</code> → <code>BUTTONS</code>).
+        Elige la subcategoría exacta antes de corregir:</p>
+        <div class="row">
+          <select id="manual-category" aria-label="Categoría">
+            <option value="gameplay_streamer">gameplay_streamer</option>
+            <option value="podcast_entrevista">podcast_entrevista</option>
+            <option value="reality_casa">reality_casa</option>
+            <option value="conversacion_reaccion">conversacion_reaccion</option>
+            <option value="otros">otros</option>
+          </select>
+          <select id="manual-subcategory" aria-label="Subcategoría"></select>
+          <button id="btn-manual-category" type="button">Corregir categoría (PATCH, sin reintroducir la URL)</button>
+        </div>
+        <div id="manual-result" class="result" aria-live="polite"></div>
+      </fieldset>
+      <div id="process-result" class="result" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <!-- 3. BIBLIOTECA -->
+  <section id="biblioteca" class="card">
+    <h2>📚 Mi biblioteca</h2>
+    <p class="hint">Desde <code>GET /api/library</code>. Retención: 7 días por clip; al caducar, el
+    archivo se borra y solo quedan los metadatos. Los favoritos <strong>no</strong> están exentos
+    del borrado a 7 días (ARQUITECTURA_V2 §4.2) salvo decisión explícita posterior del usuario.</p>
+    <form id="library-filters" class="row">
+      <input id="filter-q" type="search" placeholder="Buscar por nombre…" aria-label="Buscar por nombre">
+      <select id="filter-platform" aria-label="Plataforma">
+        <option value="">Plataforma: todas</option>
+        <option value="twitch">Twitch</option>
+        <option value="kick">Kick</option>
+        <option value="youtube">YouTube</option>
+        <option value="upload">Subida directa</option>
+      </select>
+      <label> Puntuación mín. <input id="filter-min-score" type="number" min="0" max="100" step="1" value="0"></label>
+      <label><input id="filter-favorites" type="checkbox"> Solo favoritos</label>
+      <button type="submit">Filtrar</button>
+    </form>
+    <div id="library-list" class="grid"></div>
+    <p id="library-empty" class="hint">Sin clips todavía.</p>
+    <div id="player-wrap" hidden>
+      <h3>Reproductor</h3>
+      <video id="player" controls preload="metadata" style="max-width:100%"></video>
+      <p id="player-title" class="hint"></p>
+    </div>
+    <p class="hint"><strong>Miniaturas:</strong> no hay endpoint de miniaturas en la API
+    (<code>thumbnail_path</code> existe en la BD y el worker genera <code>thumbs/{id}.jpg</code>,
+    pero ningún endpoint lo sirve). Cada clip muestra un marcador con su duración y puntuación.
+    Pendiente: exponer <code>GET /api/clips/{id}/thumbnail</code>.</p>
+  </section>
+
+  <!-- 4. COLA Y MOMENTOS -->
+  <section id="cola" class="card">
+    <h2>🧵 Cola de procesamiento y momentos</h2>
+    <div class="row">
+      <button id="btn-refresh-jobs" type="button">Actualizar trabajos y momentos</button>
+      <label>Puntuación mínima de momentos <input id="moments-min-score" type="number" min="0" max="100" step="1" value="0"></label>
+    </div>
+    <h3>Trabajos (<code>GET /api/jobs</code>)</h3>
+    <ul id="jobs-list" class="list"></ul>
+    <h3>Momentos detectados (<code>GET /api/moments?min_score=</code>)</h3>
+    <ul id="moments-list" class="list"></ul>
+  </section>
+
+  <!-- 5. COSTES -->
+  <section id="costes" class="card">
+    <h2>💰 Panel de control de costes — gasto real: 0 $</h2>
+    <p class="hint">El sistema <strong>pausa los trabajos al agotar una cuota y nunca genera cargos</strong>
+    (PRESUPUESTO §5.2, ARQUITECTURA_V2 §4.5). Ninguna cifra de gasto es inventada: lo medido viene de
+    <code>GET /api/storage/quota</code>; el resto son los límites documentados en
+    <code>docs/PRESUPUESTO.md</code> y <code>docs/ARQUITECTURA_V2.md</code>, con su fuente.</p>
+    <div id="quota-box" class="result">Cargando cuota de almacenamiento…</div>
+    <div id="cost-alerts" class="alerts" aria-live="polite"></div>
+    <table class="limits">
+      <thead><tr><th>Servicio</th><th>Límite gratuito documentado</th><th>Qué pasa al agotarse</th><th>Fuente</th></tr></thead>
+      <tbody>
+        <tr><td>Cloudflare R2 (almacenamiento)</td><td>10 GB gratis; salida 0 $; más allá: 0,015 $/GB-mes</td><td>Pausa de nuevas subidas/trabajos; borrado a 7 días libera espacio</td><td>PRESUPUESTO §1 / §4.2</td></tr>
+        <tr><td>YouTube Data API v3</td><td>10.000 unidades/día, no comprable</td><td>Pausa de sondeo/importación hasta medianoche (hora del Pacífico)</td><td>PRESUPUESTO §1; ARQ. §5</td></tr>
+        <tr><td>Twitch Helix</td><td>800 puntos/min, gratis</td><td>Reducir frecuencia de sondeo</td><td>PRESUPUESTO §1</td></tr>
+        <tr><td>Kick API</td><td>Gratis; sin límite REST publicado (429 + Retry-After)</td><td>Respetar Retry-After</td><td>PRESUPUESTO §1</td></tr>
+        <tr><td>Groq Whisper (plan gratis)</td><td>8 h de audio/día; archivos &lt;25 MB; sin tarjeta</td><td>Los trabajos pasan a faster-whisper en CPU</td><td>ARQ. §3.7 / §5</td></tr>
+        <tr><td>faster-whisper (autoalojado)</td><td>Licencia MIT, 0 $; cómputo en el host</td><td>Más latencia (0,7–2,5× tiempo real en CPU), no más coste</td><td>ARQ. §3.7</td></tr>
+        <tr><td>Neon Postgres Free (si se usa)</td><td>~100 CU-horas/proyecto/mes; 0,5 GB (cifra menor)</td><td>La BD deja de responder hasta el mes siguiente</td><td>ARQ. §3.4 / §5</td></tr>
+        <tr><td>Oracle Always Free ARM (host 0 $)</td><td>2 OCPU / 12 GB; 200 GB bloque; 10 TB salida/mes</td><td>Sin host: cae la plataforma; no hay cargo, hay caída. Riesgo de reclamación si CPU+red+memoria &lt;20% durante 7 días</td><td>ARQ. §3.1 / §5</td></tr>
+        <tr><td>Modal (crédito 30 $/mes)</td><td><strong>FUERA del camino 0 $</strong>: exige tarjeta para casi todo el crédito</td><td>No se usa en esta V2; cualquier uso futuro es decisión aparte del usuario</td><td>ARQ. §0</td></tr>
+      </tbody>
+    </table>
+    <h3>No disponible (no inventado)</h3>
+    <ul class="list">
+      <li><strong>Gasto GPU en tiempo real:</strong> no disponible — no existe endpoint ni libro de gasto (<code>usage_ledger</code>) en la API actual. En el camino 0 $ no hay GPU: el cómputo es CPU del host. Pendiente: registrar GPU-segundos por trabajo si algún día se usa GPU.</li>
+      <li><strong>Horas procesadas / consumo de API por día:</strong> no disponible — la API no expone contadores de YouTube/Twitch/Groq. El panel muestra los límites, no un consumo inventado.</li>
+      <li><strong>Gasto mensual en USD:</strong> 0 $ real en el camino 0 $ (host Oracle Always Free + R2 dentro de 10 GB + faster-whisper en CPU). No hay factura que consultar: no existe integración verificada de facturación de ningún proveedor (PRESUPUESTO §5).</li>
+    </ul>
+    <p class="hint">Configuración real del servidor (desde <code>/health</code> y <code>viralclip/config.py</code>):
+    <span id="config-line">—</span></p>
+  </section>
+</main>
+
+<footer>
+  <p>VIRALCLIP AI · Dashboard estático servido por el propio FastAPI (<code>/</code> → <code>app/static/index.html</code>).
+  Vanilla JS, sin build, sin CDN de pago. Cada dato mostrado procede de un endpoint de la API; lo que no existe se marca «no disponible».</p>
+</footer>
+<script src="/app.js"></script>
+</body>
+</html>
