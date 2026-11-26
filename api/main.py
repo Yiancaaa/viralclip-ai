@@ -35,6 +35,12 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    # El sistema de archivos del contenedor es efímero: tras cada
+    # reinicio o despliegue ./data no existe. Crearlo al arrancar cubre
+    # todos los temporales (subidas, cookies, descargas, miniaturas);
+    # sin esto, escribir en ./data da FileNotFoundError -> HTTP 500
+    # (pasó con la subida de cookies en vivo el 2026-11-26).
+    Path("./data").mkdir(parents=True, exist_ok=True)
     # Limpieza de caducidad al arrancar (el scheduler horario vive en worker/scheduler.py)
     try:
         db = SessionLocal()
@@ -433,6 +439,7 @@ async def upload_youtube_cookies(file: UploadFile = File(...)):
             400, "El archivo no contiene cookies de youtube.com. "
                  "Exporta las cookies estando en youtube.com con tu sesión iniciada.")
     storage = get_storage()
+    Path("./data").mkdir(parents=True, exist_ok=True)
     tmp = "./data/cookies_youtube_upload.txt"
     Path(tmp).write_bytes(raw)
     storage.save(settings.youtube_cookies_key, tmp)
