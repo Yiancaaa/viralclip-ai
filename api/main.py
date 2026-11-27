@@ -245,6 +245,25 @@ class PresignRequest(BaseModel):
     content_type: str = "video/mp4"
 
 
+def _accounted_used_bytes(db: Session) -> int:
+    """Bytes guardados por la plataforma: originales + clips vivos.
+
+    Es la medida que manda para la cuota en S3: el backend S3 no expone
+    un total fiable (su total_used_bytes() no está implementado y
+    devolvía 0), y antes solo se sumaban los clips — el original de
+    9 MB de La Casa no contaba y el panel mostraba "0.00 GB usados"
+    con archivos dentro (2026-11-26). Los clips caducados no cuentan:
+    expire_clips ya borró sus archivos del bucket. Las miniaturas
+    (KB) no se cuentan.
+    """
+    videos = sum(v.file_size_bytes or 0 for v in db.query(Video).all())
+    clips = sum(
+        c.file_size_bytes or 0
+        for c in db.query(Clip).filter(Clip.expired.is_(False)).all()
+    )
+    return videos + clips
+
+
 @app.post("/api/videos/upload/presign")
 def presign_upload(body: PresignRequest, db: Session = Depends(get_db)):
     """URL prefirmada para subir el archivo DIRECTO a S3 (PUT).
@@ -274,17 +293,14 @@ def presign_upload(body: PresignRequest, db: Session = Depends(get_db)):
         return {"duplicate": True, "duplicate_of": dup.id, "video_id": dup.id,
                 "title": dup.title}
     storage = get_storage()
-    if isinstance(storage, LocalStorage):
-        used = storage.total_used_bytes()
-    else:
-        used = sum(c.file_size_bytes for c in
-                   db.query(Clip).filter(Clip.expired.is_(False)).all())
+    used = _accounted_used_bytes(db)
     limit = int(settings.storage_quota_gb * 1024 ** 3)
     if used + body.size_bytes > limit:
+        free_mb = max(0, (limit - used) // 1024 ** 2)
         raise HTTPException(
             413, f"Cuota de almacenamiento llena: {used / 1024 ** 3:.2f} GB "
-                 f"usados de {settings.storage_quota_gb:.0f} GB; el archivo "
-                 f"necesita {body.size_bytes / 1024 ** 2:.0f} MB más.")
+                 f"usados de {settings.storage_quota_gb:.0f} GB; quedan {free_mb} MB libres "
+                 f"y el archivo pesa {body.size_bytes / 1024 ** 2:.0f} MB.")
     key = build_upload_key(body.sha256, suffix)
     try:
         url = presign_direct_upload(
@@ -816,11 +832,7 @@ def thumbnail_clip(clip_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/storage/quota")
 def storage_quota(db: Session = Depends(get_db)):
-    storage = get_storage()
-    if isinstance(storage, LocalStorage):
-        used = storage.total_used_bytes()
-    else:
-        used = sum(c.file_size_bytes for c in db.query(Clip).filter(Clip.expired.is_(False)).all())
+    used = _accounted_used_bytes(db)
     limit = int(settings.storage_quota_gb * 1024 ** 3)
     return {"used_bytes": used, "limit_bytes": limit, "limit_gb": settings.storage_quota_gb,
             "available_bytes": max(0, limit - used),
